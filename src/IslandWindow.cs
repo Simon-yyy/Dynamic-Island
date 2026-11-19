@@ -172,15 +172,23 @@ namespace DynamicIsland
         private readonly Dictionary<ulong, DateTime> _btBattTimestamp = new Dictionary<ulong, DateTime>();
         /// <summary>按设备地址缓存 [左, 右, 盒]（-1 未知）。</summary>
         private readonly Dictionary<ulong, int[]> _btBattParts = new Dictionary<ulong, int[]>();
+        private readonly Dictionary<ulong, DateTime> _btBattPartsTimestamp = new Dictionary<ulong, DateTime>();
+        private readonly Dictionary<ulong, int> _btBattPartsBaseOverall = new Dictionary<ulong, int>();
+        private readonly Dictionary<ulong, int> _btLastPnpBattery = new Dictionary<ulong, int>();
+        private readonly Dictionary<ulong, int> _btBattPartsPnpBaseline = new Dictionary<ulong, int>();
         /// <summary>上次发起系统电量查询的时间，用于退避重试。</summary>
         private readonly Dictionary<ulong, DateTime> _btBattRetryAt = new Dictionary<ulong, DateTime>();
         private readonly Dictionary<ulong, int> _btBattFailCount = new Dictionary<ulong, int>();
         private readonly Dictionary<ulong, BatteryQueryStatus> _btBattStatus = new Dictionary<ulong, BatteryQueryStatus>();
         private readonly Dictionary<ulong, bool> _btDeepProbed = new Dictionary<ulong, bool>();
         private readonly Dictionary<ulong, DateTime> _btLastActiveProbeAt = new Dictionary<ulong, DateTime>();
+        private readonly HashSet<ulong> _btQueryingAddrs = new HashSet<ulong>();
+        private DateTime _lastAudioActiveAt = DateTime.MinValue;
         private int _btBattInFlight;
         private const double BatteryFreshMinutes = 15.0;
-        private const double ActivePollSeconds = 120.0;
+        private const double SplitPartsFreshMinutes = 20.0;
+        private const double ActivePollSeconds = 180.0;
+        private const double AudioIdleQuietSeconds = 15.0;
         private const double ExpandPollSeconds = 20.0;
         private bool _btFirstSweep = true;   // 首次扫描只记基线，开机不弹卡片
         private bool _btPendingShrink;
@@ -2015,6 +2023,7 @@ namespace DynamicIsland
             Canvas.SetLeft(card, x);
             Canvas.SetTop(card, y);
             card.Cursor = Cursors.Hand;
+            card.MouseLeftButtonDown += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
             card.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
             {
                 e.Handled = true;
@@ -2282,6 +2291,7 @@ namespace DynamicIsland
                 Focusable = true
             };
             SoftShadow(_bcMore, 0.3);
+            _bcMore.MouseLeftButtonDown += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
             _bcMore.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
             {
                 e.Handled = true;
@@ -2332,6 +2342,7 @@ namespace DynamicIsland
                 Focusable = true
             };
             SoftShadow(_bcRead, 0.3);
+            _bcRead.MouseLeftButtonDown += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
             _bcRead.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
             {
                 e.Handled = true;
@@ -2447,7 +2458,9 @@ namespace DynamicIsland
 
                 if (i >= 1)
                 {
+                    stack.Background = Brushes.Transparent;
                     stack.Cursor = Cursors.Hand;
+                    stack.MouseLeftButtonDown += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; };
                     stack.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
                     {
                         e.Handled = true;
@@ -2566,16 +2579,26 @@ namespace DynamicIsland
                     string[] parts = line.Substring(eq + 1).Trim().Split(';');
                     int v = int.Parse(parts[0]);
                     if (v >= 0 && v <= 100) _btBattKnown[addr] = v;
+                    bool loadedSplit = false;
                     if (parts.Length >= 4)
                     {
                         var arr = new int[3];
                         for (int k = 0; k < 3; k++) int.TryParse(parts[k + 1], out arr[k]);
-                        _btBattParts[addr] = arr;
+                        if (arr[0] >= 0 && arr[1] >= 0)
+                        {
+                            _btBattParts[addr] = arr;
+                            if (v >= 0 && v <= 100) _btBattPartsBaseOverall[addr] = v;
+                            loadedSplit = true;
+                        }
                     }
                     if (parts.Length >= 5)
                     {
                         DateTime ts;
-                        if (DateTime.TryParse(parts[4], out ts)) _btBattTimestamp[addr] = ts;
+                        if (DateTime.TryParse(parts[4], out ts))
+                        {
+                            _btBattTimestamp[addr] = ts;
+                            if (loadedSplit) _btBattPartsTimestamp[addr] = ts;
+                        }
                     }
                 }
             }
@@ -2639,6 +2662,52 @@ namespace DynamicIsland
             return 300;
         }
 
+        private bool IsAudioQuietForActiveProbe(DateTime now)
+        {
+            if (AudioTap.Signal || MediaSession.Playing)
+            {
+                _lastAudioActiveAt = now;
+                return false;
+            }
+            if (_lastAudioActiveAt != DateTime.MinValue && (now - _lastAudioActiveAt).TotalSeconds < AudioIdleQuietSeconds)
+                return false;
+            return true;
+        }
+
+        private bool ShouldKeepSplitOverPnp(ulong address, int pnpVal, DateTime now, out int[] cachedParts, out int splitOverall)
+        {
+            cachedParts = null;
+            splitOverall = -1;
+            if (!_btBattParts.TryGetValue(address, out cachedParts) || cachedParts == null || cachedParts.Length < 3)
+                return false;
+            if (cachedParts[0] < 0 || cachedParts[1] < 0)
+                return false;
+
+            DateTime partsTs;
+            if (_btBattPartsTimestamp.TryGetValue(address, out partsTs) && partsTs != DateTime.MinValue)
+            {
+                if ((now - partsTs).TotalMinutes >= SplitPartsFreshMinutes)
+                    return false;
+            }
+
+            // 仅当 PnP 自身相对上次 5A 采样时的 PnP 基线发生真实变化时，才认为系统有更新的 PnP 电量；
+            // 若 PnP 一直在重复同一个旧值（如 FreeBuds Pro 5 在系统里常停在 100%），必须继续保留 5A 的真实电量。
+            int pnpBase;
+            if (_btBattPartsPnpBaseline.TryGetValue(address, out pnpBase))
+            {
+                if (pnpVal >= 0 && pnpVal <= 100 && pnpVal != pnpBase)
+                    return false;
+            }
+            else if (pnpVal >= 0 && pnpVal <= 100)
+            {
+                _btBattPartsPnpBaseline[address] = pnpVal;
+            }
+
+            if (!_btBattPartsBaseOverall.TryGetValue(address, out splitOverall) || splitOverall < 0 || splitOverall > 100)
+                splitOverall = (cachedParts[0] + cachedParts[1]) / 2;
+            return true;
+        }
+
         private void BackfillBatteryCache(BtDevice d)
         {
             if (d == null) return;
@@ -2649,26 +2718,57 @@ namespace DynamicIsland
                 DateTime now = d.BatterySampledAt != DateTime.MinValue ? d.BatterySampledAt : DateTime.Now;
                 d.BatterySampledAt = now;
                 bool changed = false;
-                int oldVal;
-                if (!_btBattKnown.TryGetValue(d.Address, out oldVal) || oldVal != d.Battery)
-                    changed = true;
-                _btBattKnown[d.Address] = d.Battery;
-                _btBattTimestamp[d.Address] = now;
-                _btBattStatus[d.Address] = BatteryQueryStatus.Fresh;
-                _btBattFailCount[d.Address] = 0;
 
                 if (d.HasSplit)
                 {
+                    int oldVal;
+                    if (!_btBattKnown.TryGetValue(d.Address, out oldVal) || oldVal != d.Battery)
+                        changed = true;
+                    _btBattKnown[d.Address] = d.Battery;
+                    _btBattTimestamp[d.Address] = now;
+                    _btBattStatus[d.Address] = BatteryQueryStatus.Fresh;
+                    _btBattFailCount[d.Address] = 0;
                     _btBattParts[d.Address] = new int[] { d.BatteryLeft, d.BatteryRight, d.BatteryCase };
+                    _btBattPartsTimestamp[d.Address] = now;
+                    _btBattPartsBaseOverall[d.Address] = d.Battery;
                 }
                 else
                 {
+                    int pnpVal = d.Battery;
+                    _btLastPnpBattery[d.Address] = pnpVal;
+
                     int[] cachedParts;
-                    if (_btBattParts.TryGetValue(d.Address, out cachedParts) && cachedParts != null && cachedParts.Length >= 3)
+                    int splitOverall;
+                    if (ShouldKeepSplitOverPnp(d.Address, pnpVal, now, out cachedParts, out splitOverall))
                     {
+                        // PnP 自身未变（如一直停在 100%）：继续保留 5A 真实整机与分体电量，绝不被旧 100% 冲回
+                        d.Battery = splitOverall;
                         d.BatteryLeft = cachedParts[0];
                         d.BatteryRight = cachedParts[1];
                         d.BatteryCase = cachedParts[2];
+                        _btBattStatus[d.Address] = BatteryQueryStatus.Fresh;
+                        _btBattFailCount[d.Address] = 0;
+                    }
+                    else
+                    {
+                        int oldVal;
+                        if (!_btBattKnown.TryGetValue(d.Address, out oldVal) || oldVal != pnpVal)
+                            changed = true;
+                        _btBattKnown[d.Address] = pnpVal;
+                        _btBattTimestamp[d.Address] = now;
+                        _btBattStatus[d.Address] = BatteryQueryStatus.Fresh;
+                        _btBattFailCount[d.Address] = 0;
+
+                        if (_btBattParts.ContainsKey(d.Address))
+                        {
+                            // PnP 自身真的发生了变化或分体缓存已过期：清掉过期分体，显示新 PnP 值并允许空闲重采分体
+                            _btBattParts.Remove(d.Address);
+                            _btBattPartsTimestamp.Remove(d.Address);
+                            _btBattPartsBaseOverall.Remove(d.Address);
+                            _btBattPartsPnpBaseline.Remove(d.Address);
+                            _btDeepProbed.Remove(d.Address);
+                            changed = true;
+                        }
                     }
                 }
                 if (changed)
@@ -2720,13 +2820,13 @@ namespace DynamicIsland
             c.ContainerId = d.ContainerId;
             c.AepId = d.AepId;
             c.CategoryHint = d.CategoryHint;
-            c.Battery = d.Battery;
-            c.BatteryLeft = d.BatteryLeft;
-            c.BatteryRight = d.BatteryRight;
-            c.BatteryCase = d.BatteryCase;
-            c.BatterySampledAt = d.BatterySampledAt;
-            c.QueryStatus = d.QueryStatus;
-            c.QuerySource = d.QuerySource;
+            c.Battery = -1;
+            c.BatteryLeft = -1;
+            c.BatteryRight = -1;
+            c.BatteryCase = -1;
+            c.BatterySampledAt = DateTime.MinValue;
+            c.QueryStatus = BatteryQueryStatus.None;
+            c.QuerySource = "";
             return c;
         }
 
@@ -2737,23 +2837,67 @@ namespace DynamicIsland
             _btLastActiveProbeAt[live.Address] = done;
             if (result.HasBattery && result.QueryStatus == BatteryQueryStatus.Fresh)
             {
-                live.Battery = result.Battery;
-                live.BatteryLeft = result.BatteryLeft;
-                live.BatteryRight = result.BatteryRight;
-                live.BatteryCase = result.BatteryCase;
-                live.BatterySampledAt = result.BatterySampledAt != DateTime.MinValue ? result.BatterySampledAt : done;
-                live.QueryStatus = BatteryQueryStatus.Fresh;
-                live.QuerySource = result.QuerySource;
+                DateTime sampledAt = result.BatterySampledAt != DateTime.MinValue ? result.BatterySampledAt : done;
                 if (!string.IsNullOrEmpty(result.CategoryHint) && string.IsNullOrEmpty(live.CategoryHint))
                     live.CategoryHint = result.CategoryHint;
                 if (!string.IsNullOrEmpty(result.ContainerId) && string.IsNullOrEmpty(live.ContainerId))
                     live.ContainerId = result.ContainerId;
-                _btBattKnown[live.Address] = live.Battery;
-                _btBattTimestamp[live.Address] = live.BatterySampledAt;
-                _btBattStatus[live.Address] = BatteryQueryStatus.Fresh;
-                _btBattFailCount[live.Address] = 0;
-                if (live.HasSplit)
+
+                if (result.HasSplit)
+                {
+                    live.Battery = result.Battery;
+                    live.BatteryLeft = result.BatteryLeft;
+                    live.BatteryRight = result.BatteryRight;
+                    live.BatteryCase = result.BatteryCase;
+                    live.BatterySampledAt = sampledAt;
+                    live.QueryStatus = BatteryQueryStatus.Fresh;
+                    live.QuerySource = result.QuerySource;
+                    _btBattKnown[live.Address] = live.Battery;
+                    _btBattTimestamp[live.Address] = live.BatterySampledAt;
+                    _btBattStatus[live.Address] = BatteryQueryStatus.Fresh;
+                    _btBattFailCount[live.Address] = 0;
                     _btBattParts[live.Address] = new int[] { live.BatteryLeft, live.BatteryRight, live.BatteryCase };
+                    _btBattPartsTimestamp[live.Address] = sampledAt;
+                    _btBattPartsBaseOverall[live.Address] = live.Battery;
+                    int lastPnp;
+                    if (_btLastPnpBattery.TryGetValue(live.Address, out lastPnp))
+                        _btBattPartsPnpBaseline[live.Address] = lastPnp;
+                }
+                else
+                {
+                    int pnpVal = result.Battery;
+                    _btLastPnpBattery[live.Address] = pnpVal;
+                    int[] cachedParts;
+                    int splitOverall;
+                    if (ShouldKeepSplitOverPnp(live.Address, pnpVal, done, out cachedParts, out splitOverall))
+                    {
+                        live.Battery = splitOverall;
+                        live.BatteryLeft = cachedParts[0];
+                        live.BatteryRight = cachedParts[1];
+                        live.BatteryCase = cachedParts[2];
+                        live.QueryStatus = BatteryQueryStatus.Fresh;
+                        _btBattStatus[live.Address] = BatteryQueryStatus.Fresh;
+                        _btBattFailCount[live.Address] = 0;
+                    }
+                    else
+                    {
+                        live.Battery = pnpVal;
+                        live.BatteryLeft = -1;
+                        live.BatteryRight = -1;
+                        live.BatteryCase = -1;
+                        live.BatterySampledAt = sampledAt;
+                        live.QueryStatus = BatteryQueryStatus.Fresh;
+                        live.QuerySource = result.QuerySource;
+                        _btBattKnown[live.Address] = live.Battery;
+                        _btBattTimestamp[live.Address] = live.BatterySampledAt;
+                        _btBattStatus[live.Address] = BatteryQueryStatus.Fresh;
+                        _btBattFailCount[live.Address] = 0;
+                        _btBattParts.Remove(live.Address);
+                        _btBattPartsTimestamp.Remove(live.Address);
+                        _btBattPartsBaseOverall.Remove(live.Address);
+                        _btBattPartsPnpBaseline.Remove(live.Address);
+                    }
+                }
                 try { SaveBatteryCache(); } catch { }
                 return;
             }
@@ -2804,34 +2948,49 @@ namespace DynamicIsland
         {
             if (devices == null || devices.Count == 0) return;
             var targets = new List<BtDevice>();
+            bool anyMissingBattery = false;
             DateTime now = DateTime.Now;
+            bool audioQuiet = IsAudioQuietForActiveProbe(now);
             for (int i = 0; i < devices.Count; i++)
             {
                 BtDevice d = devices[i];
                 if (d == null || !d.Connected) continue;
+                if (_btQueryingAddrs.Contains(d.Address))
+                    continue;
                 if (!force)
                 {
-                    // 自动轮询阶段：凡是已经在本次连接中探测过一次（_btDeepProbed），或者已有 PnP 内核电量且正在播放音频（AudioTap.Signal / MediaSession.Playing），
-                    // 绝不再自动发起 RFCOMM / GATT 无线连接，100% 依赖每 3 秒一次的 SetupAPI 纯内存 PnP 属性更新，彻底杜绝耳机断音与卡顿！
                     if (_btDeepProbed.ContainsKey(d.Address))
-                        continue;
-                    if (d.HasBattery && (AudioTap.Signal || MediaSession.Playing))
-                        continue;
-                    DateTime last;
-                    if (_btBattRetryAt.TryGetValue(d.Address, out last))
                     {
-                        int fails = 0;
-                        _btBattFailCount.TryGetValue(d.Address, out fails);
-                        if ((now - last).TotalSeconds < BatteryBackoffSeconds(fails))
+                        // 仅在音频完全静默满 15 秒且距上次同步满 180 秒时，对音频耳机静默同步一次分体电量；播放期间 0 打扰！
+                        if (!d.IsAudio || !audioQuiet)
                             continue;
+                        DateTime lastActive;
+                        if (_btLastActiveProbeAt.TryGetValue(d.Address, out lastActive) &&
+                            (now - lastActive).TotalSeconds < ActivePollSeconds)
+                            continue;
+                    }
+                    else
+                    {
+                        if (!audioQuiet)
+                            continue;
+                        DateTime last;
+                        if (_btBattRetryAt.TryGetValue(d.Address, out last))
+                        {
+                            int fails = 0;
+                            _btBattFailCount.TryGetValue(d.Address, out fails);
+                            if ((now - last).TotalSeconds < BatteryBackoffSeconds(fails))
+                                continue;
+                        }
                     }
                 }
                 if (!d.HasBattery)
                 {
+                    anyMissingBattery = true;
                     d.QueryStatus = BatteryQueryStatus.Querying;
                     _btBattStatus[d.Address] = BatteryQueryStatus.Querying;
                 }
                 _btBattRetryAt[d.Address] = now;
+                _btQueryingAddrs.Add(d.Address);
                 targets.Add(CloneForQuery(d));
             }
             if (targets.Count == 0)
@@ -2841,22 +3000,19 @@ namespace DynamicIsland
                 return;
             }
 
-            bool anyMissingBattery = false;
-            for (int i = 0; i < targets.Count; i++)
-            {
-                if (!targets[i].HasBattery) { anyMissingBattery = true; break; }
-            }
             if ((force || anyMissingBattery) && _bcRead != null)
                 _bcRead.Text = "读取中";
             if (force || anyMissingBattery)
                 RefreshBatteryCenter();
 
+            // 手动点击「读取」(force=true) 立即放行主动同步；自动后台仅在音频静默时放行 RFCOMM，绝不打断播放
+            bool allowRfcommNow = force || audioQuiet;
             System.Threading.Interlocked.Increment(ref _btBattInFlight);
             System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
                 try
                 {
-                    Bluetooth.FillBatteries(targets, 8000, true);
+                    Bluetooth.FillBatteries(targets, 8000, true, allowRfcommNow);
                 }
                 catch { }
                 Dispatcher.BeginInvoke(new Action(delegate
@@ -2867,11 +3023,12 @@ namespace DynamicIsland
                     {
                         BtDevice result = targets[i];
                         if (result == null) continue;
+                        _btQueryingAddrs.Remove(result.Address);
                         BtDevice live = FindLiveDevice(result.Address);
                         if (live != null) ApplyQueryResult(live, result, done);
                         else ApplyQueryResult(result, result, done);
                     }
-                    if (_bcRead != null) _bcRead.Text = "读取";
+                    if (_btBattInFlight <= 0 && _bcRead != null) _bcRead.Text = "读取";
                     if (_btCardOn)
                     {
                         BtDevice cardTarget = _btCardDevice != null ? (FindLiveDevice(_btCardDevice.Address) ?? _btCardDevice) : _btAudio;
@@ -3299,6 +3456,25 @@ namespace DynamicIsland
 
         protected override void OnClosed(EventArgs e)
         {
+            try
+            {
+                if (_clockTimer != null) _clockTimer.Stop();
+                if (_statsTimer != null) _statsTimer.Stop();
+                if (_specTimer != null) _specTimer.Stop();
+                if (_outTimer != null) _outTimer.Stop();
+                if (_feedTimer != null) _feedTimer.Stop();
+                if (_bubbleTimer != null) _bubbleTimer.Stop();
+                if (_passTimer != null) _passTimer.Stop();
+                if (_eqTimer != null) _eqTimer.Stop();
+                if (_btTimer != null) _btTimer.Stop();
+                if (_btHideTimer != null) _btHideTimer.Stop();
+                if (_frameHooked)
+                {
+                    CompositionTarget.Rendering -= OnFrame;
+                    _frameHooked = false;
+                }
+            }
+            catch { }
             if (_tray != null) { _tray.Dispose(); _tray = null; }
             base.OnClosed(e);
         }
@@ -3452,6 +3628,8 @@ namespace DynamicIsland
         // ------------------------------------------------------------------
         private void TickBluetooth()
         {
+            if (AudioTap.Signal || MediaSession.Playing)
+                _lastAudioActiveAt = DateTime.Now;
             if (_btPolling) return;
             _btPolling = true;
             // 枚举走 P/Invoke 很快，但仍然放后台，避免任何情况下拖慢动画
@@ -3514,6 +3692,10 @@ namespace DynamicIsland
                     {
                         _btDeepProbed.Remove(d.Address);
                         _btLastActiveProbeAt.Remove(d.Address);
+                        _btBattPartsTimestamp.Remove(d.Address);
+                        _btBattPartsBaseOverall.Remove(d.Address);
+                        _btLastPnpBattery.Remove(d.Address);
+                        _btBattPartsPnpBaseline.Remove(d.Address);
                         Bluetooth.ClearProbeCache(d.Address);
                     }
                 }
@@ -3560,7 +3742,8 @@ namespace DynamicIsland
             if (newly != null)
             {
                 ShowBtCard(newly);
-                ScheduleBatteryQueries(newlyList.Count > 0 ? newlyList : connected, true);
+                if (newlyList.Count > 0)
+                    ScheduleBatteryQueries(newlyList, false);
             }
         }
 

@@ -57,10 +57,12 @@ namespace DynamicIsland
                 catch { }
             };
 
+            string trayTip = BuildInfo.Display ?? "灵动岛";
+            if (trayTip.Length > 63) trayTip = trayTip.Substring(0, 63);
             _icon = new NotifyIcon
             {
                 Icon = icon,
-                Text = BuildInfo.Display,
+                Text = trayTip,
                 Visible = true,
                 ContextMenuStrip = menu
             };

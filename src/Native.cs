@@ -351,6 +351,10 @@ namespace DynamicIsland
         [DllImport("gdi32.dll")]
         private static extern IntPtr CreateRoundRectRgn(int l, int t, int r, int b, int w, int h);
 
+        [DllImport("gdi32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeleteObject(IntPtr hObject);
+
         [DllImport("user32.dll")]
         private static extern int SetWindowRgn(IntPtr hwnd, IntPtr hrgn, bool redraw);
 
@@ -366,7 +370,8 @@ namespace DynamicIsland
             if (ph < 1) ph = 1;
             var hrgn = CreateRoundRectRgn(px, py, px + pw + 1, py + ph + 1,
                 (int)Math.Round((radius + 2) * 2 * dpi), (int)Math.Round((radius + 2) * 2 * dpi));
-            SetWindowRgn(hwnd, hrgn, true);
+            if (hrgn != IntPtr.Zero && SetWindowRgn(hwnd, hrgn, true) == 0)
+                DeleteObject(hrgn);
         }
 
         public static void ClearRegion(IntPtr hwnd)

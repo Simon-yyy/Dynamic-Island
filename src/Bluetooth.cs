@@ -390,6 +390,10 @@ namespace DynamicIsland
                     _rfcommMissAt.Remove(address);
                 }
             }
+            if (address == 0)
+            {
+                lock (_snapLock) { _snapshot = null; }
+            }
         }
 
         private static void EnsureWsaStarted()
@@ -1146,21 +1150,26 @@ namespace DynamicIsland
         /// </summary>
         public static void FillBatteries(IList<BtDevice> devices, int timeoutMs, bool allowGattFallback)
         {
+            FillBatteries(devices, timeoutMs, allowGattFallback, allowGattFallback);
+        }
+
+        public static void FillBatteries(IList<BtDevice> devices, int timeoutMs, bool allowGattFallback, bool allowRfcommActive)
+        {
             if (devices == null || devices.Count == 0) return;
             PropSnapshot snap = GetSnapshot(timeoutMs);
             for (int i = 0; i < devices.Count; i++)
                 ApplySnapshot(devices[i], snap);
 
-            if (!allowGattFallback) return;
+            if (!allowGattFallback && !allowRfcommActive) return;
             for (int i = 0; i < devices.Count; i++)
             {
                 BtDevice d = devices[i];
                 if (d == null) continue;
 
-                // 通道 2：针对华为/荣耀耳机，若尚未在当前连接会话中被标记为无 5A 响应，则尝试轻量非破坏式 SPP 5A（若已记住有效端口则仅连单端口，一旦未响应则 30 分钟内不再打扰蓝牙基带）
+                // 通道 2：针对华为/荣耀耳机，允许主动 RFCOMM 且未在 30 分钟冷却期内时查询分体电量
                 bool isHuaweiLike = LooksLikeSppCapableAudio(d.Name);
                 bool canTrySpp = false;
-                if (d.IsAudio && isHuaweiLike)
+                if (allowRfcommActive && d.IsAudio && isHuaweiLike)
                 {
                     lock (_wsaLock)
                     {
@@ -1193,8 +1202,8 @@ namespace DynamicIsland
                     }
                 }
 
-                // 通道 3：标准 BLE GATT 0x180F / 0x2A19（仅在 PnP 内核属性未提供电量时才读取，且优先读系统 Cached 缓存，零空中包干扰键鼠/音频）
-                if (!d.HasBattery)
+                // 通道 3：标准 BLE GATT 0x180F / 0x2A19（仅限明确带 BLE 能力的设备，绝不对纯经典蓝牙设备发起 BLE 寻呼干扰耳机音频）
+                if (allowGattFallback && !d.HasBattery && (d.IsBle || !string.IsNullOrEmpty(d.AepId)))
                 {
                     try
                     {
@@ -1215,8 +1224,8 @@ namespace DynamicIsland
                     }
                 }
 
-                // 通道 4：非华为命名但仍属音频且尚未拿到电量的设备，也尝试一次非破坏式 SPP 5A
-                if (d.IsAudio && !isHuaweiLike && !d.HasBattery)
+                // 通道 4：非华为命名但仍属音频且尚未拿到电量的设备，仅在允许主动 RFCOMM 时尝试一次 SPP 5A
+                if (allowRfcommActive && d.IsAudio && !isHuaweiLike && !d.HasBattery)
                 {
                     try
                     {
@@ -1455,7 +1464,7 @@ namespace DynamicIsland
                 }
                 catch { le = null; }
             }
-            if (le == null)
+            if (le == null && d.IsBle)
             {
                 try
                 {
@@ -1470,34 +1479,48 @@ namespace DynamicIsland
             var battSvcUuid = new Guid("0000180f-0000-1000-8000-00805f9b34fb");
             var chrUuid = new Guid("00002a19-0000-1000-8000-00805f9b34fb");
 
-            var svc = (Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult)AwaitWith(
-                le.GetGattServicesForUuidAsync(battSvcUuid),
-                typeof(Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult), timeoutMs);
-            if (svc == null || svc.Status != Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus.Success || svc.Services.Count == 0)
-                return false;
-
             var values = new List<int>();
-            for (int s = 0; s < svc.Services.Count; s++)
+            try
             {
-                var service = svc.Services[s];
-                if (service == null) continue;
-                var chr = (Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicsResult)AwaitWith(
-                    service.GetCharacteristicsForUuidAsync(chrUuid),
-                    typeof(Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicsResult), timeoutMs);
-                if (chr == null || chr.Status != Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus.Success || chr.Characteristics.Count == 0)
-                    continue;
+                var svc = (Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult)AwaitWith(
+                    le.GetGattServicesForUuidAsync(battSvcUuid),
+                    typeof(Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult), timeoutMs);
+                if (svc == null || svc.Status != Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus.Success || svc.Services.Count == 0)
+                    return false;
 
-                for (int c = 0; c < chr.Characteristics.Count; c++)
+                for (int s = 0; s < svc.Services.Count; s++)
                 {
-                    var ch = chr.Characteristics[c];
-                    if (ch == null) continue;
-                    int pct;
-                    if (TryReadGattCharacteristicPercent(ch, Windows.Devices.Bluetooth.BluetoothCacheMode.Cached, timeoutMs, out pct) ||
-                        TryReadGattCharacteristicPercent(ch, Windows.Devices.Bluetooth.BluetoothCacheMode.Uncached, timeoutMs, out pct))
+                    var service = svc.Services[s];
+                    if (service == null) continue;
+                    try
                     {
-                        values.Add(pct);
+                        var chr = (Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicsResult)AwaitWith(
+                            service.GetCharacteristicsForUuidAsync(chrUuid),
+                            typeof(Windows.Devices.Bluetooth.GenericAttributeProfile.GattCharacteristicsResult), timeoutMs);
+                        if (chr == null || chr.Status != Windows.Devices.Bluetooth.GenericAttributeProfile.GattCommunicationStatus.Success || chr.Characteristics.Count == 0)
+                            continue;
+
+                        for (int c = 0; c < chr.Characteristics.Count; c++)
+                        {
+                            var ch = chr.Characteristics[c];
+                            if (ch == null) continue;
+                            int pct;
+                            if (TryReadGattCharacteristicPercent(ch, Windows.Devices.Bluetooth.BluetoothCacheMode.Cached, timeoutMs, out pct) ||
+                                TryReadGattCharacteristicPercent(ch, Windows.Devices.Bluetooth.BluetoothCacheMode.Uncached, timeoutMs, out pct))
+                            {
+                                values.Add(pct);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        try { service.Dispose(); } catch { }
                     }
                 }
+            }
+            finally
+            {
+                try { le.Dispose(); } catch { }
             }
 
             if (values.Count == 0) return false;
@@ -2258,6 +2281,16 @@ namespace DynamicIsland
                     "\r\n";
                 lock (_logLock)
                 {
+                    try
+                    {
+                        if (System.IO.File.Exists(path) && new System.IO.FileInfo(path).Length > 1024 * 1024)
+                        {
+                            string oldPath = path + ".old";
+                            if (System.IO.File.Exists(oldPath)) System.IO.File.Delete(oldPath);
+                            System.IO.File.Move(path, oldPath);
+                        }
+                    }
+                    catch { }
                     System.IO.File.AppendAllText(path, line, Encoding.UTF8);
                 }
             }

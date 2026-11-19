@@ -17,6 +17,7 @@ Windows 10 / 11 桌面顶部「灵动岛」常驻小组件：收起态为悬浮�
 ├─ island.ico            多尺寸内嵌程序图标（256/64/48/32/16）
 ├─ README.md             项目说明与使用文档
 ├─ 问题排查与解决方案记录.md 历次问题现象、根因分析与最终技术解决方案完整记录
+├─ MAP.md                项目模块拓扑地图与开发导航
 ├─ MEMORY.md             项目架构约束与工程经验库（Knowledge Runtime）
 ├─ src/                  核心 C# 源码（共 17 个模块，严格兼容 .NET Framework 4.x C# 5）
 │  ├─ Program.cs         程序入口、Per-Monitor DPI 感知初始化与命令行参数解析
@@ -72,10 +73,10 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -InstallDir "E:\Dynamic
      通过 `SetupDiGetClassDevsW` 遍历当前在线节点，读取 `DEVPKEY_Device_BatteryLife`（`{104EA319-6EE2-4701-BD47-8DDBF425BBE5}, pid=2`），并结合 `cfgmgr32.dll` 的 `CM_Get_Parent` + `CM_Get_Device_IDW` 向上回溯最多 6 层父节点。这样无论是 `BTHHFENUM\BthHFPAudio`（蓝牙免提音频节点）、`HID\...`（如 `M87-BT1` 机械键盘）还是 `BTHLEDEVICE\...`（BLE GATT 电池服务子节点），都能在纯内存态关联到根蓝牙设备的 12 位 MAC 地址并拿到实时电量，**不向蓝牙设备发送任何无线数据包，对听歌、打字、游戏延迟完全零影响**。
   2. **第二层：华为 FreeBuds Pro 5（HarmonyOS 7.0+）Winsock2 `AF_BTH` RFCOMM 通道 1 分体电量直读**
      针对华为 FreeBuds Pro 3 / 4 / 5 等使用私有 MBB（`0x5A`）协议的耳机，通过原生 `ws2_32.dll` 蓝牙套接字直连 **RFCOMM Channel 1（`port = 1`）** 发送 `0x01 0x08` 电量查询帧并解析 TLV `0x01`（整机）与 `0x02`（左耳 / 右耳 / 充电盒三字节分体电量），在界面展示 `左 / 右` 及 `盒XX%`。
-  3. **第三层：会话级免打扰与播放期禁扰保护**
-     - 周期枚举中**严禁调用** `BluetoothLEDevice.FromBluetoothAddressAsync` / `EnumerateBlePaired` 等会触发 2.4GHz 天线寻呼的 WinRT 接口，彻底消除背景蓝牙扫描抢占 A2DP 音频时隙导致的听歌微卡顿。
-     - 严禁主动连接 `0000111e`（HFP 免提通话服务），防止耳机在立体声 A2DP 与免提通话模式之间切换导致断音。
-     - `port = 1` 私有通道仅在耳机刚连上（且当前未在播放音乐）时静默探测 **1 次**并缓存分体电量；听歌、暂停/恢复播放或展开面板时 **100% 走内核内存直读（0 蓝牙发包）**，仅在用户手动点击右上角「读取」按钮时才重新发起主动协议刷新。
+  3. **第三层：双源基线隔离、静默期同步与零音频打扰保护**
+     - **零无线电干扰**：周期枚举 100% 走 `SetupAPI` 纯内存读取；`TryBleGatt` 严格限定仅对 BLE 设备执行，绝不对纯经典蓝牙设备发起 `FromBluetoothAddressAsync` 2.4GHz 空中寻呼，也绝不触碰 `0000111e`（HFP 免提服务）。
+     - **PnP 与 `5A` 同源基线隔离**：记录 `5A` 采样时的 PnP 基线值，防止 Windows 内核长期停在 `100%` 的粗糙读数在 3 秒后把 `5A` 读到的真实分体电量覆盖回弹；同时配合单设备单飞锁（`_btQueryingAddrs`）杜绝并发抢占 RFCOMM 通道 1。
+     - **静默自动同步 + 手动即时刷新**：播放音乐期间 0 RFCOMM 建连；当音频完全静默满 15 秒且距上次同步满 180 秒时，后台自动静默刷新分体电量；点击电量中心右上角 **「读取」** 按钮或设备槽位时立即清空快照缓存并全通道刷新。
 
 ### 2. 北京时间（UTC+8）日光律动天色（`src/SolarRhythm.cs`）
 - **严格锁定北京时间（UTC+8）**：内部统一通过 `ToUniversalTime().AddHours(8.0)` 换算北京时间，不受机器本地时区偏移影响；展开面板左上角日期旁与托盘右键菜单均实时显示当前天色阶段名称。
@@ -96,6 +97,10 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -InstallDir "E:\Dynamic
 - **双通道歌词同步**：优先订阅 Windows GSMTC 时间轴事件并按流逝时间线性外推；当播放器未上报系统时间轴时，自动降级至桌面歌词 OCR（`LyricWatch.cs`）与窗口底部时间码 OCR（`ScreenClock.cs`）校准。
 - **封面流光与 WASAPI 频谱**：自动提取专辑封面主色与副色渲染双色氛围光；通过 WASAPI Loopback 实时计算 2048 点 FFT 驱动 28 段音律频谱。
 
+### 4. 顶部状态栏动态贴合与胶囊自由拖拽（`src/Native.cs` / `src/IslandWindow.cs`）
+- **实时避让顶部状态栏**：自动识别顶部状态栏（如荣耀顶部栏、MyDockFinder、顶部自动隐藏任务栏）的实时可见下边缘，状态栏展开时平滑下移紧贴下沿，状态栏隐藏后自动贴回屏幕顶边。
+- **左键拖拽、居中磁吸与位置记忆**：按住胶囊左键拖动超过 4px 即可自由调整位置，靠近屏幕水平中线（`±10px`）自动磁吸居中，松手后持久化到 `data\island_pos.txt`，并可通过托盘菜单「重置胶囊位置 (居中贴顶)」一键还原。
+
 ---
 
 ## 自动化自检与排障
@@ -105,4 +110,4 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -InstallDir "E:\Dynamic
   python3 tools/test_battery_logic.py
   python3 tools/test_media_timeline.py
   ```
-- **运行日志**：蓝牙电量查询日志保存在 `data\island_query.log`（仅记录设备类别、MAC 后 4 位掩码、查询状态与通道来源，保护隐私）；电量持久化缓存在 `data\btbattery.txt`。
+- **运行日志**：蓝牙电量查询日志保存在 `data\island_query.log`（仅记录设备类别、MAC 后 4 位掩码、查询状态与通道来源，超过 1MB 自动轮转至 `.old`）；电量持久化缓存在 `data\btbattery.txt`。

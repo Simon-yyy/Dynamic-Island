@@ -85,3 +85,26 @@
 - **核心结论**: 在 WPF 中使用 `Ellipse` 与 `System.Windows.Shapes.Path` 叠合同心进度环时，严禁为 `Path` 施加非零 Margin；`Path` 必须设为 `HorizontalAlignment=Left, VerticalAlignment=Top, Margin=0` 且其内部绝对几何圆心必须与 `Ellipse` 的布局中心严格一致。
 - **成立证据**: `Path` 在 `Stretch.None` 模式下若被施加 Margin，其内部绝对坐标会叠加外边距，导致底环与进度弧产生偏心错位。
 - **失效条件**: 进度环重构为自定义单一渲染图元后废止。
+
+### [ID: UI-CaptureMouseClickBubbling]
+- **角色**: Constraint
+- **生效范围**: `src/IslandWindow.cs`
+- **核心结论**: 由于主舞台 `_stage.MouseLeftButtonDown`（`OnDown`）会调用 `_stage.CaptureMouse()` 支持拖拽，面板内任何依赖 `MouseLeftButtonUp` 响应点击的子控件（如 `_bcRead`、`_bcMore`、设备槽位 `stack`、微信卡片 `card`）必须同时在 `MouseLeftButtonDown` 中设置 `e.Handled = true`。
+- **成立证据**: 若子控件不拦截 `MouseLeftButtonDown`，事件冒泡到 `_stage` 并捕获鼠标后，松开鼠标时的 `MouseLeftButtonUp` 会直接路由到 `_stage`，导致子控件点击回调完全失效。
+- **失效条件**: 拖拽机制改为仅在移动超过阈值后才捕获鼠标或彻底移出 `_stage` 事件路由后废止。
+
+### [ID: Bluetooth-SplitVsPnpBaselineIsolation]
+- **角色**: Constraint
+- **生效范围**: `src/IslandWindow.cs`, `src/Bluetooth.cs`
+- **核心结论**:
+  1. 华为 `5A` 协议读取到的分体电量与 Windows 内核 PnP `DEVPKEY_Device_BatteryLife` 属于不同精度数据源，严禁拿 PnP 数值与 `5A` 整机电量直接做差值比较；必须记录 `5A` 采样时的 PnP 基线（`_btBattPartsPnpBaseline`），仅当 PnP 相对自身基线真正变化时才淘汰分体缓存。
+  2. `TryBleGatt` 与 `BluetoothLEDevice.FromBluetoothAddressAsync` 仅允许对明确具备 BLE 能力的设备调用，严禁对纯经典蓝牙设备触发 BLE 寻呼；且 `CloneForQuery` 必须清空旧电量字段并配合单飞锁（`_btQueryingAddrs`）防止并发旧值覆盖。
+- **成立证据**: FreeBuds Pro 5 在 Windows PnP 中常停留在 `100%`，跨源比对会导致 `5A` 更新出真实电量 3 秒后被 PnP `100%` 冲回；对纯经典设备调用 `FromBluetoothAddressAsync` 会引发 2.4GHz 空中寻呼干扰音频流。
+- **失效条件**: Windows 内核驱动原生上报高精度分体电量后废止。
+
+### [ID: Audio-LyricWatchOriginalStability]
+- **角色**: Constraint
+- **生效范围**: `src/LyricWatch.cs`, `src/AudioTap.cs`
+- **核心结论**: 修复蓝牙电量或交互问题时，严禁顺带改动已验证稳定的 `LyricWatch.cs`（特别是 `IsBlank` 的 `min = 255` 逻辑与 OCR 流处理）及 `AudioTap.cs` 采集循环。
+- **成立证据**: 修改 `LyricWatch.IsBlank` 初值及 WinRT 流包装会直接引发桌面歌词识别回锚失效、歌词丢失。
+- **失效条件**: 在真机实测环境下专门重构歌词同步模块并通过回归验证后废止。
