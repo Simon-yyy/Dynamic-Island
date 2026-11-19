@@ -1,0 +1,5 @@
+﻿version=2026.11.17.batt-multi13
+stamp=2026-11-18T15:07:05+08:00
+feature=pnp-cfgmgr32+winsock-rfcomm-ch1+multi-device+freebuds-pro5
+main=E:\Tools\灵动岛-状态栏贴合与可拖动版-20261117\灵动岛.exe
+note=托盘提示应为：灵动岛 2026.11.17.batt-multi13 (2026-11-18T15:07:05+08:00)
